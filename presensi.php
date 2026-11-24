@@ -1,170 +1,111 @@
 <?php
 require_once '../koneksi.php';
-$user = wajib_admin();
+$user = wajib_mahasiswa();
+$nim = $user['nim'];
+
+$matkul = mk_diambil($nim, $user['semester']);
+$kodeKrs = array_column($matkul, 'kode_mk');
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $aksi = post('aksi');
+    $sesiId = (int) post('sesi_id');
+    $status = post('status');
 
-    if ($aksi === 'buka_sesi') {
-        $kode = post('kode_mk');
-        $pertemuan = (int) post('pertemuan');
-        $tgl = post('tanggal');
-        if (!ambil_satu('SELECT kode_mk FROM mata_kuliah WHERE kode_mk = ?', [$kode]) || $pertemuan < 1 || !strtotime($tgl)) {
-            pesan('Pilih mata kuliah, isi pertemuan (angka) dan tanggal dengan benar.', 'gagal');
-        } else {
-            jalankan("INSERT INTO sesi_presensi (kode_mk, pertemuan, tanggal, status) VALUES (?, ?, ?, 'Buka')",
-                     [$kode, $pertemuan, $tgl]);
-            pesan('Sesi presensi dibuka. Mahasiswa sudah bisa mengisi presensi.');
-        }
-        pindah('presensi.php');
-    }
+    $sesi = ambil_satu('SELECT * FROM sesi_presensi WHERE id = ?', [$sesiId]);
 
-    if ($aksi === 'saklar') {
-        jalankan("UPDATE sesi_presensi SET status = IF(status = 'Buka', 'Tutup', 'Buka') WHERE id = ?", [(int) post('id')]);
-        pesan('Status sesi presensi diubah.');
-        pindah('presensi.php');
+    if (!$sesi) {
+        pesan('Sesi presensi tidak ditemukan.', 'gagal');
+    } elseif ($sesi['status'] !== 'Buka') {
+        pesan('Presensi untuk sesi ini sudah ditutup admin.', 'gagal');
+    } elseif (!in_array($sesi['kode_mk'], $kodeKrs)) {
+        pesan('Mata kuliah ini tidak ada di KRS Anda.', 'gagal');
+    } elseif (!in_array($status, ['Hadir', 'Izin', 'Sakit'])) {
+        pesan('Status presensi tidak valid.', 'gagal');
+    } else {
+        jalankan('INSERT INTO presensi (sesi_id, nim, jam_masuk, status, catatan) VALUES (?, ?, ?, ?, ?)
+                  ON DUPLICATE KEY UPDATE jam_masuk = VALUES(jam_masuk), status = VALUES(status), catatan = VALUES(catatan)',
+                 [$sesiId, $nim, date('H:i:s'), $status, post('catatan')]);
+        pesan('Presensi tersimpan.');
     }
-
-    if ($aksi === 'hapus_sesi') {
-        jalankan('DELETE FROM sesi_presensi WHERE id = ?', [(int) post('id')]);
-        pesan('Sesi presensi dihapus beserta catatan kehadirannya.');
-        pindah('presensi.php');
-    }
-
-    if ($aksi === 'ubah_status') {
-        $sesiId = (int) post('sesi_id');
-        $nim = post('nim');
-        $status = post('status');
-        if ($status === '') {
-            jalankan('DELETE FROM presensi WHERE sesi_id = ? AND nim = ?', [$sesiId, $nim]);
-        } elseif (in_array($status, ['Hadir', 'Izin', 'Sakit', 'Alpha'])) {
-            jalankan('INSERT INTO presensi (sesi_id, nim, jam_masuk, status) VALUES (?, ?, ?, ?)
-                      ON DUPLICATE KEY UPDATE status = VALUES(status)', [$sesiId, $nim, date('H:i:s'), $status]);
-        }
-        pesan('Kehadiran diperbarui.');
-        pindah('presensi.php?sesi=' . $sesiId);
-    }
+    pindah('presensi.php');
 }
 
-$sesiDipilih = get('sesi') !== '' ? ambil_satu('SELECT s.*, m.nama_mk FROM sesi_presensi s
-                                                 JOIN mata_kuliah m ON m.kode_mk = s.kode_mk WHERE s.id = ?', [(int) get('sesi')]) : null;
-$rekap = [];
-if ($sesiDipilih) {
-    $rekap = ambil_semua('SELECT mh.nim, mh.nama_lengkap, p.status, p.jam_masuk, p.catatan
-                          FROM krs k
-                          JOIN mahasiswa mh ON mh.nim = k.nim
-                          LEFT JOIN presensi p ON p.nim = k.nim AND p.sesi_id = ?
-                          WHERE k.kode_mk = ?
-                          GROUP BY mh.nim, mh.nama_lengkap, p.status, p.jam_masuk, p.catatan
-                          ORDER BY mh.nama_lengkap', [$sesiDipilih['id'], $sesiDipilih['kode_mk']]);
-}
+$sesiBuka = ambil_semua("SELECT s.id, s.pertemuan, s.tanggal, m.nama_mk, p.status AS status_saya, p.catatan
+        FROM sesi_presensi s
+        JOIN mata_kuliah m ON m.kode_mk = s.kode_mk
+        JOIN krs k ON k.kode_mk = s.kode_mk AND k.nim = ? AND k.semester = ?
+        LEFT JOIN presensi p ON p.sesi_id = s.id AND p.nim = ?
+        WHERE s.status = 'Buka'
+        ORDER BY s.tanggal DESC", [$nim, $user['semester'], $nim]);
 
-$daftar = ambil_semua("SELECT s.*, m.nama_mk,
-        (SELECT COUNT(*) FROM krs k WHERE k.kode_mk = s.kode_mk) AS peserta,
-        (SELECT COUNT(*) FROM presensi p WHERE p.sesi_id = s.id AND p.status = 'Hadir') AS hadir
-        FROM sesi_presensi s JOIN mata_kuliah m ON m.kode_mk = s.kode_mk
-        ORDER BY s.tanggal DESC, s.id DESC LIMIT 100");
+$filter = get('filter');
+$riwayat = ambil_semua("SELECT p.*, s.tanggal, s.pertemuan, m.nama_mk
+        FROM presensi p
+        JOIN sesi_presensi s ON s.id = p.sesi_id
+        JOIN mata_kuliah m ON m.kode_mk = s.kode_mk
+        WHERE p.nim = ? AND (? = '' OR s.kode_mk = ?)
+        ORDER BY s.tanggal DESC, p.jam_masuk DESC LIMIT 50", [$nim, $filter, $filter]);
 
-$judul = 'Buka/Tutup Presensi';
+$judul = 'Presensi';
 include '../includes/header.php';
 ?>
-<h1>Buka / Tutup Presensi</h1>
+<h1>Presensi Kuliah</h1>
 
-<?php if ($sesiDipilih): ?>
 <div class="kartu">
-    <h2>Rekap: <?= e($sesiDipilih['nama_mk']) ?> - pertemuan <?= e($sesiDipilih['pertemuan']) ?> (<?= tanggal($sesiDipilih['tanggal']) ?>)</h2>
-    <p>Status sesi:
-        <span class="lencana <?= $sesiDipilih['status'] === 'Buka' ? 'hijau' : 'abu' ?>"><?= e($sesiDipilih['status']) ?></span>
-        <a href="presensi.php" class="tombol abu kecil">Kembali</a>
-    </p>
-    <?php if (!$rekap): ?>
-        <p class="kosong">Belum ada mahasiswa yang mengambil mata kuliah ini di KRS.</p>
+    <h2>Presensi yang sedang dibuka</h2>
+    <?php if (!$sesiBuka): ?>
+        <p class="kosong">Tidak ada presensi yang dibuka untuk mata kuliah Anda saat ini.</p>
     <?php else: ?>
-        <div class="gulir">
-            <table>
-                <tr><th>NIM</th><th>Nama</th><th>Jam</th><th>Catatan</th><th>Ubah kehadiran</th></tr>
-                <?php foreach ($rekap as $r): ?>
-                    <tr>
-                        <td><?= e($r['nim']) ?></td>
-                        <td><?= e($r['nama_lengkap']) ?></td>
-                        <td><?= $r['jam_masuk'] ? e(substr($r['jam_masuk'], 0, 5)) : '-' ?></td>
-                        <td><?= e($r['catatan']) ?></td>
-                        <td>
-                            <form method="post" class="aksi">
-                                <input type="hidden" name="aksi" value="ubah_status">
-                                <input type="hidden" name="sesi_id" value="<?= $sesiDipilih['id'] ?>">
-                                <input type="hidden" name="nim" value="<?= e($r['nim']) ?>">
-                                <select name="status">
-                                    <option value="">Belum isi</option>
-                                    <?= opsi(sama(['Hadir', 'Izin', 'Sakit', 'Alpha']), $r['status'] ?? '') ?>
-                                </select>
-                                <button type="submit" class="tombol kecil">Simpan</button>
-                            </form>
-                        </td>
-                    </tr>
-                <?php endforeach; ?>
-            </table>
-        </div>
+        <?php foreach ($sesiBuka as $s): ?>
+            <div class="item">
+                <h3><?= e($s['nama_mk']) ?> - pertemuan <?= e($s['pertemuan']) ?></h3>
+                <p class="keterangan">Tanggal <?= tanggal($s['tanggal']) ?></p>
+                <form method="post" class="filter">
+                    <input type="hidden" name="sesi_id" value="<?= $s['id'] ?>">
+                    <div>
+                        <label>Status</label>
+                        <select name="status"><?= opsi(sama(['Hadir', 'Izin', 'Sakit']), $s['status_saya'] ?? 'Hadir') ?></select>
+                    </div>
+                    <div>
+                        <label>Catatan (boleh kosong)</label>
+                        <input type="text" name="catatan" value="<?= e($s['catatan'] ?? '') ?>">
+                    </div>
+                    <button type="submit" class="tombol"><?= $s['status_saya'] ? 'Perbarui presensi' : 'Simpan presensi' ?></button>
+                </form>
+            </div>
+        <?php endforeach; ?>
     <?php endif; ?>
 </div>
-<?php endif; ?>
 
 <div class="kartu">
-    <h2>Buka sesi presensi baru</h2>
-    <form method="post" class="form-isi">
-        <input type="hidden" name="aksi" value="buka_sesi">
+    <h2>Riwayat presensi</h2>
+    <form method="get" class="filter">
         <div>
-            <label for="kode_mk">Mata kuliah</label>
-            <select id="kode_mk" name="kode_mk" required><?= opsi(daftar_matkul()) ?></select>
+            <label for="filter">Mata kuliah</label>
+            <select id="filter" name="filter">
+                <option value="">Semua</option>
+                <?php foreach ($matkul as $mk): ?>
+                    <option value="<?= e($mk['kode_mk']) ?>" <?= $filter === $mk['kode_mk'] ? 'selected' : '' ?>><?= e($mk['nama_mk']) ?></option>
+                <?php endforeach; ?>
+            </select>
         </div>
-        <div>
-            <label for="pertemuan">Pertemuan ke-</label>
-            <input type="number" id="pertemuan" name="pertemuan" min="1" max="30" value="1" required>
-        </div>
-        <div>
-            <label for="tanggal">Tanggal</label>
-            <input type="date" id="tanggal" name="tanggal" value="<?= date('Y-m-d') ?>" required>
-        </div>
-        <div class="penuh">
-            <button type="submit" class="tombol hijau">Buka presensi</button>
-        </div>
+        <button type="submit" class="tombol abu">Saring</button>
     </form>
-</div>
 
-<div class="kartu">
-    <h2>Daftar sesi presensi</h2>
-    <?php if (!$daftar): ?>
-        <p class="kosong">Belum ada sesi presensi. Buat sesi baru di atas.</p>
+    <?php if (!$riwayat): ?>
+        <p class="kosong">Belum ada data presensi.</p>
     <?php else: ?>
         <div class="gulir">
             <table>
-                <tr><th>Tanggal</th><th>Mata kuliah</th><th>Pertemuan</th><th>Hadir</th><th>Status</th><th></th></tr>
-                <?php foreach ($daftar as $s): ?>
+                <tr><th>Tanggal</th><th>Mata kuliah</th><th>Pertemuan</th><th>Jam</th><th>Status</th><th>Catatan</th></tr>
+                <?php foreach ($riwayat as $r): ?>
+                    <?php $warna = $r['status'] === 'Hadir' ? 'hijau' : ($r['status'] === 'Alpha' ? 'merah' : 'kuning'); ?>
                     <tr>
-                        <td><?= tanggal($s['tanggal']) ?></td>
-                        <td><?= e($s['nama_mk']) ?></td>
-                        <td><?= e($s['pertemuan']) ?></td>
-                        <td><?= $s['hadir'] ?> / <?= $s['peserta'] ?></td>
-                        <td><span class="lencana <?= $s['status'] === 'Buka' ? 'hijau' : 'abu' ?>"><?= e($s['status']) ?></span></td>
-                        <td>
-                            <div class="aksi">
-                                <form method="post">
-                                    <input type="hidden" name="aksi" value="saklar">
-                                    <input type="hidden" name="id" value="<?= $s['id'] ?>">
-                                    <?php if ($s['status'] === 'Buka'): ?>
-                                        <button type="submit" class="tombol merah kecil">Tutup</button>
-                                    <?php else: ?>
-                                        <button type="submit" class="tombol hijau kecil">Buka lagi</button>
-                                    <?php endif; ?>
-                                </form>
-                                <a href="?sesi=<?= $s['id'] ?>" class="tombol kecil">Rekap</a>
-                                <form method="post" onsubmit="return confirm('Hapus sesi ini beserta catatan kehadirannya?')">
-                                    <input type="hidden" name="aksi" value="hapus_sesi">
-                                    <input type="hidden" name="id" value="<?= $s['id'] ?>">
-                                    <button type="submit" class="tombol abu kecil">Hapus</button>
-                                </form>
-                            </div>
-                        </td>
+                        <td><?= tanggal($r['tanggal']) ?></td>
+                        <td><?= e($r['nama_mk']) ?></td>
+                        <td><?= e($r['pertemuan']) ?></td>
+                        <td><?= $r['jam_masuk'] ? e(substr($r['jam_masuk'], 0, 5)) : '-' ?></td>
+                        <td><span class="lencana <?= $warna ?>"><?= e($r['status']) ?></span></td>
+                        <td><?= e($r['catatan']) ?></td>
                     </tr>
                 <?php endforeach; ?>
             </table>

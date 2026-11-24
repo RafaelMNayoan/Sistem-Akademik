@@ -1,69 +1,94 @@
 <?php
 require_once '../koneksi.php';
-$user = wajib_admin();
+$user = wajib_mahasiswa();
+$nim = $user['nim'];
+$semester = $user['semester'];
 
-$total = ambil_satu("SELECT
-    (SELECT COUNT(*) FROM mahasiswa) AS mahasiswa,
-    (SELECT COUNT(*) FROM mata_kuliah) AS matkul,
-    (SELECT COUNT(*) FROM sesi_presensi WHERE status = 'Buka') AS presensi_buka,
-    (SELECT COUNT(*) FROM tagihan WHERE status NOT IN ('Dibayar','Dibatalkan')) AS tagihan_belum,
-    (SELECT COUNT(*) FROM tugas_kuliah) AS tugas,
-    (SELECT COUNT(*) FROM materi_kuliah) AS materi");
+$ipk = hitung_ipk($nim);
+$krs = mk_diambil($nim, $semester);
+$totalSks = array_sum(array_column($krs, 'sks'));
 
-$terbaru = ambil_semua('SELECT nim, nama_lengkap, program_studi, tgl_daftar FROM mahasiswa ORDER BY tgl_daftar DESC, nim DESC LIMIT 5');
+$tagihan = ambil_semua('SELECT * FROM tagihan WHERE nim = ? ORDER BY id DESC LIMIT 3', [$nim]);
 
-$sesiBuka = ambil_semua("SELECT s.id, s.pertemuan, s.tanggal, m.nama_mk
-                         FROM sesi_presensi s JOIN mata_kuliah m ON m.kode_mk = s.kode_mk
-                         WHERE s.status = 'Buka' ORDER BY s.tanggal DESC");
+$baris = ambil_satu("SELECT COUNT(*) AS total FROM tagihan WHERE nim = ? AND status NOT IN ('Dibayar','Dibatalkan')", [$nim]);
+$belumBayar = $baris['total'];
 
-$judul = 'Dashboard Admin';
+$presensiBuka = ambil_semua("SELECT s.pertemuan, m.nama_mk
+        FROM sesi_presensi s
+        JOIN mata_kuliah m ON m.kode_mk = s.kode_mk
+        JOIN krs k ON k.kode_mk = s.kode_mk AND k.nim = ? AND k.semester = ?
+        WHERE s.status = 'Buka' AND s.id NOT IN (SELECT sesi_id FROM presensi WHERE nim = ?)",
+        [$nim, $semester, $nim]);
+
+$baris = ambil_satu("SELECT COUNT(*) AS total FROM tugas_kuliah t
+        JOIN krs k ON k.kode_mk = t.kode_mk AND k.nim = ? AND k.semester = ?
+        WHERE t.batas_waktu > NOW()
+          AND t.id NOT IN (SELECT tugas_id FROM pengumpulan_tugas WHERE nim = ?)",
+        [$nim, $semester, $nim]);
+$tugasBelum = $baris['total'];
+
+$judul = 'Dashboard';
 include '../includes/header.php';
 ?>
-<h1>Dashboard Admin</h1>
+<h1>Dashboard</h1>
 
 <div class="ringkasan">
-    <div class="kartu"><span>Mahasiswa</span><strong><?= $total['mahasiswa'] ?></strong></div>
-    <div class="kartu"><span>Mata kuliah</span><strong><?= $total['matkul'] ?></strong></div>
-    <div class="kartu"><span>Presensi dibuka</span><strong><?= $total['presensi_buka'] ?></strong></div>
-    <div class="kartu"><span>Tagihan belum lunas</span><strong><?= $total['tagihan_belum'] ?></strong></div>
+    <div class="kartu"><span>Status</span><strong><?= e($user['status']) ?></strong></div>
+    <div class="kartu"><span>Semester</span><strong><?= e($semester) ?></strong></div>
+    <div class="kartu"><span>IPK</span><strong><?= number_format($ipk, 2) ?></strong></div>
+    <div class="kartu"><span>SKS semester ini</span><strong><?= $totalSks ?></strong></div>
 </div>
 
-<div class="dua-kolom sama-kolom">
+<?php if ($presensiBuka): ?>
+    <div class="pesan sukses">
+        Presensi sedang dibuka untuk:
+        <?php foreach ($presensiBuka as $p): ?>
+            <strong><?= e($p['nama_mk']) ?></strong> (pertemuan <?= e($p['pertemuan']) ?>)<?= $p === end($presensiBuka) ? '.' : ',' ?>
+        <?php endforeach; ?>
+        <a href="presensi.php">Isi presensi sekarang</a>
+    </div>
+<?php endif; ?>
+<?php if ($tugasBelum > 0): ?>
+    <div class="pesan gagal">Ada <?= $tugasBelum ?> tugas yang belum Anda kumpulkan. <a href="tugas.php">Lihat tugas</a></div>
+<?php endif; ?>
+
+<div class="dua-kolom">
     <div class="kartu">
-        <h2>Mahasiswa terbaru</h2>
-        <?php if (!$terbaru): ?>
-            <p class="kosong">Belum ada mahasiswa.</p>
+        <h2>KRS semester <?= e($semester) ?></h2>
+        <?php if (!$krs): ?>
+            <p class="kosong">Belum ada mata kuliah. <a href="krs.php">Isi KRS sekarang</a>.</p>
         <?php else: ?>
             <div class="gulir">
                 <table>
-                    <tr><th>NIM</th><th>Nama</th><th>Program studi</th></tr>
-                    <?php foreach ($terbaru as $m): ?>
+                    <tr><th>Kode</th><th>Mata kuliah</th><th class="angka">SKS</th></tr>
+                    <?php foreach ($krs as $mk): ?>
                         <tr>
-                            <td><?= e($m['nim']) ?></td>
-                            <td><?= e($m['nama_lengkap']) ?></td>
-                            <td><?= e($m['program_studi']) ?></td>
+                            <td><?= e($mk['kode_mk']) ?></td>
+                            <td><?= e($mk['nama_mk']) ?></td>
+                            <td class="angka"><?= $mk['sks'] ?></td>
                         </tr>
                     <?php endforeach; ?>
                 </table>
             </div>
+            <p><a href="krs.php">Kelola KRS</a></p>
         <?php endif; ?>
-        <p><a href="mahasiswa.php">Kelola data mahasiswa</a></p>
     </div>
 
     <div class="kartu">
-        <h2>Presensi yang sedang dibuka</h2>
-        <?php if (!$sesiBuka): ?>
-            <p class="kosong">Tidak ada sesi presensi yang dibuka.</p>
+        <h2>Tagihan terbaru</h2>
+        <?php if (!$tagihan): ?>
+            <p class="kosong">Belum ada tagihan.</p>
         <?php else: ?>
-            <?php foreach ($sesiBuka as $s): ?>
+            <?php foreach ($tagihan as $t): ?>
                 <p>
-                    <strong><?= e($s['nama_mk']) ?></strong> - pertemuan <?= e($s['pertemuan']) ?>
-                    <span class="keterangan">(<?= tanggal($s['tanggal']) ?>)</span>
+                    <?= e($t['nama_tagihan']) ?><br>
+                    <?= rupiah($t['total_bayar']) ?>
+                    <span class="lencana <?= $t['status'] === 'Dibayar' ? 'hijau' : 'kuning' ?>"><?= e($t['status']) ?></span>
                 </p>
             <?php endforeach; ?>
+            <p class="keterangan"><?= $belumBayar ?> tagihan belum dibayar.</p>
+            <p><a href="tagihan.php">Lihat semua tagihan</a></p>
         <?php endif; ?>
-        <p><a href="presensi.php">Buka/tutup presensi</a></p>
-        <p class="keterangan">Total tugas: <?= $total['tugas'] ?> - Total materi: <?= $total['materi'] ?></p>
     </div>
 </div>
 <?php include '../includes/footer.php'; ?>
