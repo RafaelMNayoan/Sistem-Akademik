@@ -1,116 +1,153 @@
 <?php
 require_once '../koneksi.php';
-$user = wajib_mahasiswa();
-$nim = $user['nim'];
-$semester = (int) $user['semester'];
-$batasSks = 24;
+$user = wajib_portal('krs');
+$role = $user['role'];
+$bp = prodi_batas();
+$did = (int) ($user['dosen_id'] ?? 0);
+$lihatIsi = $role !== 'bendahara'; // Bendahara hanya melihat status bayar
+
+/* Apakah mahasiswa ini dalam cakupan peran (prodi untuk Kaprodi, bimbingan untuk Dosen)? */
+function mhs_dalam_cakupan($m)
+{
+    global $role, $bp, $did;
+    if (!$m) return false;
+    if ($role === 'kaprodi') return $m['program_studi'] === $bp;
+    if ($role === 'dosen') return $did > 0 && (int) $m['dosen_pa_id'] === $did;
+    return true;
+}
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    if (isset($_POST['batal'])) {
-        $baris = ambil_satu('SELECT status FROM krs WHERE id = ? AND nim = ?', [(int) $_POST['batal'], $nim]);
-        if ($baris && $baris['status'] === 'Disetujui') {
-            pesan('KRS yang sudah disetujui tidak dapat dibatalkan sendiri. Hubungi Kaprodi atau Staff.', 'gagal');
-            pindah('krs.php');
+    $aksi = post('aksi');
+
+    if ($aksi === 'setujui' || $aksi === 'tolak') {
+        $nim = post('nim');
+        $sem = (int) post('semester');
+        $m = ambil_satu('SELECT nim, program_studi, dosen_pa_id FROM mahasiswa WHERE nim = ?', [$nim]);
+        $jumlah = ambil_satu('SELECT COUNT(*) AS n FROM krs WHERE nim = ? AND semester = ?', [$nim, $sem]);
+        if (!bisa('A') || !mhs_dalam_cakupan($m) || (int) $jumlah['n'] === 0) {
+            pesan('Anda tidak berhak memproses KRS ini.', 'gagal');
+        } elseif ($aksi === 'setujui' && ambil_pengaturan('krs_wajib_lunas') === '1' && jumlah_tunggakan($nim) > 0) {
+            pesan('KRS belum bisa disetujui: mahasiswa masih memiliki tagihan yang belum lunas (syarat bayar KRS aktif).', 'gagal');
+        } elseif ($aksi === 'tolak' && post('catatan') === '') {
+            pesan('Tuliskan alasan penolakan pada kolom catatan.', 'gagal');
+        } else {
+            $baru = $aksi === 'setujui' ? 'Disetujui' : 'Ditolak';
+            jalankan('UPDATE krs SET status = ?, diproses_oleh = ?, diproses_pada = ?, catatan = ? WHERE nim = ? AND semester = ?',
+                     [$baru, $user['nama'], date('Y-m-d H:i:s'), kosong_ke_null(post('catatan')), $nim, $sem]);
+            catat_log('krs', $aksi . ' KRS', "nim $nim semester $sem -> $baru");
+            pesan('KRS ' . $nim . ' semester ' . $sem . ' ' . strtolower($baru) . '.');
         }
-        jalankan('DELETE FROM krs WHERE id = ? AND nim = ?', [(int) $_POST['batal'], $nim]);
-        pesan('Mata kuliah dibatalkan dari KRS.');
         pindah('krs.php');
     }
-    $kode = post('ambil');
-    $mk = ambil_satu("SELECT * FROM mata_kuliah WHERE kode_mk = ? AND status_kurikulum = 'Disetujui' AND (prodi IS NULL OR prodi = ?)", [$kode, $user['program_studi'] ?? '']);
-    $sudahAda = ambil_satu('SELECT COALESCE(SUM(m.sks), 0) AS total FROM krs k JOIN mata_kuliah m ON m.kode_mk = k.kode_mk WHERE k.nim = ? AND k.semester = ?', [$nim, $semester]);
-    if (!$mk) {
-        pesan('Mata kuliah tidak ditemukan atau belum masuk kurikulum aktif prodi Anda.', 'gagal');
-    } elseif (ambil_pengaturan('krs_wajib_lunas') === '1' && jumlah_tunggakan($nim) > 0) {
-        pesan('Anda masih memiliki tagihan yang belum lunas. Selesaikan pembayaran untuk mengisi KRS.', 'gagal');
-    } elseif ((int)$sudahAda['total'] + (int)$mk['sks'] > $batasSks) {
-        pesan('Total SKS tidak boleh lebih dari ' . $batasSks . '.', 'gagal');
-    } else {
-        jalankan('INSERT IGNORE INTO krs (nim, semester, kode_mk) VALUES (?, ?, ?)', [$nim, $semester, $kode]);
-        pesan('Mata kuliah ' . $kode . ' masuk ke KRS.');
+
+    if ($aksi === 'setujui_semua') {
+        if (!bisa('A')) { pesan('Anda tidak berhak menyetujui KRS.', 'gagal'); pindah('krs.php'); }
+        $syaratSemua = "k.status = 'Diajukan'"; $pSemua = [];
+        if ($role === 'kaprodi') { $syaratSemua .= ' AND mh.program_studi = ?'; $pSemua[] = $bp; }
+        if ($role === 'dosen') { $syaratSemua .= ' AND mh.dosen_pa_id = ?'; $pSemua[] = $did; }
+        $antrian = ambil_semua("SELECT DISTINCT k.nim, k.semester FROM krs k JOIN mahasiswa mh ON mh.nim = k.nim WHERE $syaratSemua", $pSemua);
+        $ok = 0; $lewat = 0;
+        foreach ($antrian as $q) {
+            if (ambil_pengaturan('krs_wajib_lunas') === '1' && jumlah_tunggakan($q['nim']) > 0) { $lewat++; continue; }
+            jalankan("UPDATE krs SET status = 'Disetujui', diproses_oleh = ?, diproses_pada = ? WHERE nim = ? AND semester = ? AND status = 'Diajukan'", [$user['nama'], date('Y-m-d H:i:s'), $q['nim'], $q['semester']]);
+            $ok++;
+        }
+        catat_log('krs', 'setujui semua KRS', "$ok disetujui, $lewat dilewati (belum lunas)");
+        pesan("$ok KRS disetujui" . ($lewat ? ", $lewat dilewati karena belum lunas." : '.'));
+        pindah('krs.php');
+    }
+
+    if ($aksi === 'simpan') {
+        $id = (int) post('id');
+        $lama = ambil_satu('SELECT * FROM krs WHERE id = ?', [$id]);
+        $sem = (int) post('semester');
+        $kode = post('kode_mk');
+        if (!bisa('U') || !$lama) {
+            pesan('Anda tidak berhak mengubah KRS.', 'gagal');
+        } elseif ($sem < 1 || $sem > 14 || !ambil_satu('SELECT kode_mk FROM mata_kuliah WHERE kode_mk = ?', [$kode])) {
+            pesan('Semester (1-14) dan mata kuliah harus valid.', 'gagal');
+        } else {
+            try {
+                jalankan("UPDATE krs SET semester = ?, kode_mk = ?, status = 'Diajukan', diproses_oleh = ?, diproses_pada = ?, catatan = NULL WHERE id = ?", [$sem, $kode, $user['nama'], date('Y-m-d H:i:s'), $id]);
+                catat_log('krs', 'ubah KRS', "id $id nim {$lama['nim']}: " . beda($lama, ['semester' => $sem, 'kode_mk' => $kode]) . ' (status kembali Diajukan)');
+                pesan('KRS diperbarui dan diajukan ulang untuk persetujuan.');
+            } catch (PDOException $ex) {
+                pesan('Mata kuliah itu sudah ada di KRS mahasiswa pada semester tersebut.', 'gagal');
+            }
+        }
+        pindah('krs.php');
     }
     pindah('krs.php');
 }
 
-$krs = ambil_semua('SELECT k.id, k.status, k.catatan, m.kode_mk, m.nama_mk, m.sks, m.kelas FROM krs k JOIN mata_kuliah m ON m.kode_mk = k.kode_mk WHERE k.nim = ? AND k.semester = ? ORDER BY m.kode_mk', [$nim, $semester]);
-$totalSks = array_sum(array_column($krs, 'sks'));
-$kodeDiambil = array_column($krs, 'kode_mk');
-$semuaMk = ambil_semua("SELECT * FROM mata_kuliah WHERE status_kurikulum = 'Disetujui' AND (prodi IS NULL OR prodi = ?) ORDER BY kode_mk", [$user['program_studi'] ?? '']);
-$kaprodi = ambil_satu("SELECT nama FROM akun_pengguna WHERE role = 'kaprodi' AND status = 'Aktif' ORDER BY (prodi = ?) DESC, nama LIMIT 1", [$user['program_studi'] ?? '']);
-$tanggalCetak = date('d F Y');
+$edit = get('edit') !== '' && bisa('U') ? ambil_satu('SELECT k.*, mh.nama_lengkap FROM krs k JOIN mahasiswa mh ON mh.nim = k.nim WHERE k.id = ?', [(int) get('edit')]) : null;
+
+$fStatus = get('status');
+$cari = get('cari');
+$syarat = "(mh.nim LIKE ? OR mh.nama_lengkap LIKE ?) AND (? = '' OR k.status = ?)";
+$param = ["%$cari%", "%$cari%", $fStatus, $fStatus];
+if ($role === 'kaprodi') { $syarat .= ' AND mh.program_studi = ?'; $param[] = $bp; }
+if ($role === 'dosen') { $syarat .= ' AND mh.dosen_pa_id = ?'; $param[] = $did; }
+$baris = ambil_semua("SELECT k.id, k.nim, k.semester, k.status, k.catatan, k.diproses_oleh, mh.nama_lengkap, mh.program_studi, mh.dosen_pa_id, m.kode_mk, m.nama_mk, m.sks
+    FROM krs k JOIN mahasiswa mh ON mh.nim = k.nim JOIN mata_kuliah m ON m.kode_mk = k.kode_mk
+    WHERE $syarat ORDER BY k.nim, k.semester, m.kode_mk", $param);
+$grup = [];
+foreach ($baris as $b) {
+    $g = $b['nim'] . '|' . $b['semester'];
+    $grup[$g]['nim'] = $b['nim'];
+    $grup[$g]['nama'] = $b['nama_lengkap'];
+    $grup[$g]['semester'] = $b['semester'];
+    $grup[$g]['program_studi'] = $b['program_studi'];
+    $grup[$g]['dosen_pa_id'] = $b['dosen_pa_id'];
+    $grup[$g]['sks'] = ($grup[$g]['sks'] ?? 0) + (int) $b['sks'];
+    $grup[$g]['status'][$b['status']] = true;
+    $grup[$g]['catatan'] = $grup[$g]['catatan'] ?? $b['catatan'];
+    $grup[$g]['mk'][] = $b;
+}
+
 $judul = 'KRS';
 include '../includes/header.php';
 ?>
-<h1>Kartu Rencana Studi - Semester <?= e($semester) ?></h1>
+<h1>KRS Mahasiswa</h1>
+<?php if ($edit): ?>
 <div class="kartu">
-    <h2>Mata kuliah yang diambil</h2>
-    <?php if (!$krs): ?>
-        <p class="kosong">Belum ada mata kuliah di KRS. Pilih dari daftar di bawah.</p>
-    <?php else: ?>
-        <div class="gulir"><table>
-            <tr><th>No</th><th>Kode</th><th>Mata kuliah</th><th class="angka">SKS</th><th>Kelas</th><th>Status</th><th></th></tr>
-            <?php foreach ($krs as $no => $mk): ?>
-            <tr>
-                <td><?= $no + 1 ?></td><td><?= e($mk['kode_mk']) ?></td><td><?= e($mk['nama_mk']) ?></td><td class="angka"><?= (int)$mk['sks'] ?></td><td><?= e($mk['kelas']) ?></td>
-                <td><?= lencana($mk['status']) ?><?php if ($mk['catatan']): ?><br><span class="keterangan"><?= e($mk['catatan']) ?></span><?php endif; ?></td>
-                <td><?php if ($mk['status'] !== 'Disetujui'): ?><form method="post" onsubmit="return confirm('Batalkan mata kuliah ini dari KRS?')"><input type="hidden" name="batal" value="<?= (int)$mk['id'] ?>"><button type="submit" class="tombol merah kecil">Batalkan</button></form><?php endif; ?></td>
-            </tr>
-            <?php endforeach; ?>
-        </table></div>
-        <p><strong>Total: <?= (int)$totalSks ?> SKS</strong> dari maksimal <?= $batasSks ?> SKS</p>
-        <button type="button" class="tombol" onclick="window.print()">Cetak KRS</button>
-    <?php endif; ?>
+    <h2>Ubah KRS <?= e($edit['nim']) ?> - <?= e($edit['nama_lengkap']) ?></h2>
+    <form method="post" class="form-isi">
+        <input type="hidden" name="aksi" value="simpan"><input type="hidden" name="id" value="<?= $edit['id'] ?>">
+        <div><label for="kode_mk">Mata kuliah</label><select id="kode_mk" name="kode_mk" required><?= opsi(daftar_matkul(), $edit['kode_mk']) ?></select></div>
+        <div><label for="semester">Semester</label><input type="number" id="semester" name="semester" min="1" max="14" value="<?= e($edit['semester']) ?>" required></div>
+        <div class="penuh"><small>Setelah diubah, status KRS kembali menjadi "Diajukan" dan harus disetujui ulang.</small></div>
+        <div class="penuh baris-tombol"><button type="submit" class="tombol">Simpan perubahan</button><a href="krs.php" class="tombol abu">Batal</a></div>
+    </form>
 </div>
-
-<?php if ($krs): ?>
-<section class="area-cetak">
-    <div class="kop-krs">
-        <h2>STMIK PESAT NABIRE</h2>
-        <p><strong>KARTU RENCANA STUDI (KRS)</strong></p>
-        <p>Tahun Akademik: ____________________ &nbsp; Semester: <?= e($semester) ?></p><hr>
-    </div>
-    <table class="identitas-krs">
-        <tr><td width="22%">Nama Mahasiswa</td><td>: <?= e($user['nama_lengkap']) ?></td><td width="15%">NIM</td><td>: <?= e($nim) ?></td></tr>
-        <tr><td>Program Studi</td><td>: <?= e($user['program_studi'] ?? '-') ?></td><td>Semester</td><td>: <?= e($semester) ?></td></tr>
-    </table>
-    <table class="tabel-cetak-krs">
-        <thead><tr><th>No</th><th>Kode MK</th><th>Mata Kuliah</th><th>SKS</th><th>Kelas</th></tr></thead>
-        <tbody><?php foreach ($krs as $no => $mk): ?><tr><td><?= $no + 1 ?></td><td><?= e($mk['kode_mk']) ?></td><td><?= e($mk['nama_mk']) ?></td><td><?= (int)$mk['sks'] ?></td><td><?= e($mk['kelas']) ?></td></tr><?php endforeach; ?></tbody>
-        <tfoot><tr><th colspan="3" style="text-align:right">Total SKS</th><th><?= (int)$totalSks ?></th><th></th></tr></tfoot>
-    </table>
-    <p class="tanggal-krs">Nabire, <?= e($tanggalCetak) ?></p>
-    <div class="ttd-krs">
-        <div><p>Mengetahui,<br>Ketua Program Studi</p><div class="ruang-ttd"></div><strong><?= e($kaprodi['nama'] ?? '________________________') ?></strong><br><span>Kaprodi</span></div>
-        <div><p>Mahasiswa</p><div class="ruang-ttd"></div><strong><?= e($user['nama_lengkap']) ?></strong><br><span><?= e($nim) ?></span></div>
-    </div>
-</section>
 <?php endif; ?>
-
 <div class="kartu">
-    <h2>Daftar mata kuliah tersedia</h2>
-    <?php if (!$semuaMk): ?><p class="kosong">Admin belum menambahkan mata kuliah.</p><?php else: ?>
-    <div class="gulir"><table><tr><th>Kode</th><th>Mata kuliah</th><th class="angka">SKS</th><th>Kelas</th><th></th></tr>
-    <?php foreach ($semuaMk as $mk): ?><tr>
-        <td><?= e($mk['kode_mk']) ?></td><td><?= e($mk['nama_mk']) ?></td><td class="angka"><?= (int)$mk['sks'] ?></td><td><?= e($mk['kelas']) ?></td><td>
-        <?php if (in_array($mk['kode_mk'], $kodeDiambil, true)): ?><span class="lencana hijau">Sudah diambil</span><?php else: ?><form method="post"><input type="hidden" name="ambil" value="<?= e($mk['kode_mk']) ?>"><button type="submit" class="tombol kecil">Ambil</button></form><?php endif; ?>
-        </td></tr><?php endforeach; ?>
+    <h2>Daftar KRS<?= $role === 'dosen' ? ' mahasiswa bimbingan saya' : ($bp !== null ? ' prodi ' . e($bp) : '') ?></h2>
+    <form method="get" class="filter">
+        <div><label for="cari">Cari NIM atau nama</label><input type="text" id="cari" name="cari" value="<?= e($cari) ?>"></div>
+        <div><label for="status">Status</label><select id="status" name="status"><option value="">Semua</option><?= opsi(sama(['Diajukan', 'Disetujui', 'Ditolak']), $fStatus) ?></select></div>
+        <button type="submit" class="tombol abu">Saring</button>
+    </form>
+    <?php if (bisa('A')): ?><form method="post" onsubmit="return confirm('Setujui semua KRS berstatus Diajukan?')" style="margin-bottom:12px"><input type="hidden" name="aksi" value="setujui_semua"><button type="submit" class="tombol hijau">Setujui semua KRS yang diajukan</button></form><?php endif; ?>
+    <?php if (!$grup): ?><p class="kosong">Belum ada data KRS.</p><?php else: ?>
+    <div class="gulir"><table>
+        <tr><th>Mahasiswa</th><th>Sem</th><?php if ($lihatIsi): ?><th>Mata kuliah</th><?php endif; ?><th class="angka">SKS</th><th>Status KRS</th><th>Status bayar</th><?php if (bisa('A') || bisa('U')): ?><th></th><?php endif; ?></tr>
+        <?php foreach ($grup as $g): $stat = array_keys($g['status']); $ringkas = count($stat) === 1 ? $stat[0] : 'Diajukan'; $tung = jumlah_tunggakan($g['nim']);
+              $punya = mhs_dalam_cakupan(['program_studi' => $g['program_studi'], 'dosen_pa_id' => $g['dosen_pa_id']]); ?>
+        <tr>
+            <td><?= e($g['nim']) ?> - <?= e($g['nama']) ?></td><td><?= e($g['semester']) ?></td>
+            <?php if ($lihatIsi): ?><td><?php foreach ($g['mk'] as $r): ?><div><?= e($r['kode_mk']) ?> - <?= e($r['nama_mk']) ?> <?php if (count($stat) > 1): ?><?= lencana($r['status']) ?><?php endif; ?><?php if (bisa('U')): ?> <a href="?edit=<?= $r['id'] ?>">ubah</a><?php endif; ?></div><?php endforeach; ?></td><?php endif; ?>
+            <td class="angka"><?= $g['sks'] ?></td>
+            <td><?= lencana($ringkas) ?><?php if ($g['catatan']): ?><br><span class="keterangan"><?= e($g['catatan']) ?></span><?php endif; ?></td>
+            <td><?= $tung === 0 ? lencana('Lunas') : lencana('Belum lunas') ?></td>
+            <?php if (bisa('A') || bisa('U')): ?><td>
+                <?php if (bisa('A') && $punya): ?>
+                <form method="post" class="aksi"><input type="hidden" name="nim" value="<?= e($g['nim']) ?>"><input type="hidden" name="semester" value="<?= e($g['semester']) ?>">
+                    <input type="text" name="catatan" placeholder="Catatan (wajib bila ditolak)">
+                    <?php if ($ringkas !== 'Disetujui'): ?><button type="submit" name="aksi" value="setujui" class="tombol hijau kecil">Setujui</button><?php endif; ?>
+                    <?php if ($ringkas !== 'Ditolak'): ?><button type="submit" name="aksi" value="tolak" class="tombol merah kecil">Tolak</button><?php endif; ?></form>
+                <?php endif; ?></td><?php endif; ?>
+        </tr><?php endforeach; ?>
     </table></div><?php endif; ?>
 </div>
-<style>
-.area-cetak{display:none}
-@media print{
- @page{size:A4;margin:18mm}
- body{background:#fff!important;color:#000!important;font-family:Arial,sans-serif}
- body *{visibility:hidden!important}
- .area-cetak,.area-cetak *{visibility:visible!important}
- .area-cetak{display:block!important;position:absolute;left:0;top:0;width:100%;font-size:12px}
- .kop-krs{text-align:center;line-height:1.35}.kop-krs h2{font-size:17px;margin:0}.kop-krs p{margin:5px 0}
- .identitas-krs{width:100%;margin:18px 0 14px;border-collapse:collapse}.identitas-krs td{border:0;padding:4px 2px}
- .tabel-cetak-krs{width:100%;border-collapse:collapse;margin-top:8px}.tabel-cetak-krs th,.tabel-cetak-krs td{border:1px solid #222;padding:7px;text-align:left}
- .tabel-cetak-krs th:first-child,.tabel-cetak-krs th:nth-child(4),.tabel-cetak-krs td:first-child,.tabel-cetak-krs td:nth-child(4){text-align:center}
- .tanggal-krs{text-align:right;margin-top:35px}.ttd-krs{display:flex;justify-content:space-between;text-align:center;margin-top:18px;gap:50px}
- .ttd-krs>div{width:45%}.ttd-krs p{min-height:36px;margin:0}.ruang-ttd{height:75px}
- .ttd-krs strong{display:inline-block;min-width:180px;text-decoration:underline}
-}
-</style>
 <?php include '../includes/footer.php'; ?>
